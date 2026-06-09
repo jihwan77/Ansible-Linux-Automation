@@ -2,6 +2,8 @@
 
 # Ansible 기반 Linux 서버 초기 세팅 자동화 프로젝트
 
+[확장 설계: vSphere Template 기반 Ansible 접속 자동화](#18-확장-설계-vsphere-template-기반-ansible-접속-자동화)
+
 ## 1. 프로젝트 개요
 
 본 프로젝트는 신규 Linux 서버가 배포되었을 때 반복적으로 수행해야 하는 초기 설정 작업을 Ansible Playbook으로 자동화한 미니 프로젝트입니다.
