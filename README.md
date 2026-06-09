@@ -610,74 +610,515 @@ SELinux를 단순히 비활성화하지 않고 현재 상태를 점검하는 방
 
 ## 17. 트러블슈팅
 
-### 17.1 SSH 접속 권한 문제
 
-Ansible Control 서버에서 관리 대상 서버로 접속하기 위해 SSH Key 기반 인증을 구성했습니다.
+
+### 17.1 root SSH 로그인 차단 설정 미적용 문제
+
+SSH 보안 설정 Role에서 `/etc/ssh/sshd_config` 파일의 `PermitRootLogin` 값을 `no`로 변경했지만, 실제로는 MobaXterm에서 root 계정으로 SSH 접속이 가능한 문제가 발생했습니다.
+
+
+즉, 설정 파일에는 `PermitRootLogin no`가 보였지만 실제 SSH 데몬이 적용 중인 값은 `yes`였습니다.
+
+---
+
+#### 원인
+
+Rocky Linux / RHEL 계열의 OpenSSH 설정 파일에는 일반적으로 다음과 같은 Include 구문이 포함되어 있습니다.
+
+```text
+Include /etc/ssh/sshd_config.d/*.conf
+```
+
+이로 인해 `/etc/ssh/sshd_config`뿐만 아니라 `/etc/ssh/sshd_config.d/` 디렉토리 아래의 `.conf` 파일들도 함께 읽힙니다.
+
+문제 원인을 찾기 위해 다음 명령으로 전체 SSH 설정 파일을 검색했습니다.
+
+```bash
+grep -Rni 'PermitRootLogin' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/
+```
+
+확인 결과 다음과 같이 별도 drop-in 설정 파일에서 root 로그인을 허용하고 있었습니다.
+
+```text
+/etc/ssh/sshd_config.d/01-permitrootlogin.conf:3:PermitRootLogin yes
+/etc/ssh/sshd_config:40:PermitRootLogin no
+```
+
+즉, 메인 설정 파일에서는 root 로그인을 차단하고 있었지만, `/etc/ssh/sshd_config.d/01-permitrootlogin.conf` 파일에서 다시 root 로그인을 허용하고 있었기 때문에 실제 적용값이 `yes`로 유지되었습니다.
+
+```text
+/etc/ssh/sshd_config.d/01-permitrootlogin.conf
+  PermitRootLogin yes
+
+/etc/ssh/sshd_config
+  PermitRootLogin no
+
+실제 적용값
+  permitrootlogin yes
+```
+
+이 문제를 통해 SSH 설정은 단순히 `/etc/ssh/sshd_config`만 확인하는 것이 아니라, `sshd -T` 명령으로 실제 적용값을 검증해야 한다는 점을 확인했습니다.
+
+---
+
+#### 해결 방법
+
+
+
+기존 SSH Role은 `/etc/ssh/sshd_config` 파일만 수정하도록 구성되어 있었습니다.
+
+```yaml
+- name: Disable root SSH login
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: '^#?PermitRootLogin'
+    line: "PermitRootLogin {{ permit_root_login }}"
+    backup: true
+  notify: Restart sshd
+```
+
+하지만 실제 문제는 `/etc/ssh/sshd_config.d/01-permitrootlogin.conf` 파일에서 발생했기 때문에, 향후에는 충돌 가능성이 있는 drop-in 파일도 함께 관리하는 방식이 더 적절하다고 판단했습니다.
+
+개선된 방식은 다음과 같습니다.
+
+```yaml
+- name: Remove conflicting root login config
+  ansible.builtin.file:
+    path: /etc/ssh/sshd_config.d/01-permitrootlogin.conf
+    state: absent
+  notify: Restart sshd
+
+- name: Configure SSH hardening drop-in
+  ansible.builtin.copy:
+    dest: /etc/ssh/sshd_config.d/00-hardening.conf
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      PermitRootLogin no
+      PasswordAuthentication yes
+  notify: Restart sshd
+```
+
+handler는 기존과 동일하게 구성합니다.
+
+```yaml
+- name: Restart sshd
+  ansible.builtin.systemd:
+    name: sshd
+    state: restarted
+```
+
+이 방식은 SSH 보안 설정을 별도 drop-in 파일로 관리할 수 있어 설정 의도가 명확하고, Ansible이 관리하는 파일과 OS 기본 설정 파일을 분리할 수 있다는 장점이 있습니다.
+
+다만 다른 `.conf` 파일에서 동일 옵션을 다시 설정하면 충돌이 발생할 수 있으므로, 최종적으로는 반드시 다음 명령으로 실제 적용값을 확인해야 합니다.
+
+```bash
+sshd -T | grep -i permitrootlogin
+```
+
+---
+
+### 17.2 vSphere 사용자 지정 스크립트 미실행 문제
+
+vSphere Template과 사용자 지정 규격을 이용해 VM을 배포하면서 `postcustomization` 스크립트를 통해 `ansible` 계정, SSH 공개키, sudoers 설정을 자동 생성하려고 했습니다.
+
+하지만 템플릿에서 VM을 복제한 뒤에도 관리 대상 서버 내부에 `ansible` 사용자가 생성되지 않는 문제가 발생했습니다.
+
+
+---
+
+#### 원인
+
+Rocky Linux에서 vSphere 사용자 지정 스크립트를 실행하려면 `open-vm-tools`의 custom script 실행 옵션이 활성화되어 있어야 합니다.
+
+템플릿 원본 VM에서 다음 명령으로 설정값을 확인했습니다.
+
+```bash
+vmware-toolbox-cmd config get deployPkg enable-custom-scripts
+```
+
+문제가 있는 경우 다음과 같이 출력될 수 있습니다.
+
+```text
+[deployPkg] enable-custom-scripts = false
+```
+
+이 값이 `false`이면 vSphere 사용자 지정 규격에 스크립트를 입력하더라도 실제 게스트 OS 내부에서 스크립트가 실행되지 않습니다.
+
+---
+
+#### 해결 방법
+
+템플릿 원본 VM에서 custom script 실행 옵션을 활성화했습니다.
+
+```bash
+vmware-toolbox-cmd config set deployPkg enable-custom-scripts true
+systemctl restart vmtoolsd
+```
+
+설정값을 다시 확인했습니다.
+
+```bash
+vmware-toolbox-cmd config get deployPkg enable-custom-scripts
+```
+
+정상적으로 설정되면 다음과 같이 출력됩니다.
+
+```text
+[deployPkg] enable-custom-scripts = true
+```
+
+이후 해당 VM을 다시 템플릿으로 변환하고, 사용자 지정 규격을 적용하여 VM을 재배포했습니다.
+
+---
+
+#### 템플릿 VM 필수 패키지 확인
+
+vSphere Guest Customization이 정상 동작하려면 템플릿 VM에 `open-vm-tools`와 관련 패키지가 설치되어 있어야 합니다.
+
+Rocky Linux 템플릿 원본 VM에서 다음 패키지를 설치했습니다.
+
+```bash
+dnf install -y open-vm-tools perl sudo openssh-server
+```
+
+그리고 `vmtoolsd`와 `sshd` 서비스를 활성화했습니다.
+
+```bash
+systemctl enable --now vmtoolsd
+systemctl enable --now sshd
+```
+
+서비스 상태는 다음 명령으로 확인했습니다.
+
+```bash
+systemctl status vmtoolsd --no-pager
+systemctl status sshd --no-pager
+```
+
+`vmtoolsd`가 정상적으로 실행 중이어야 vSphere의 Guest Customization과 사용자 지정 스크립트가 정상적으로 동작합니다.
+
+
+---
+
+
+## 18. 확장 설계: vSphere Template 기반 Ansible 접속 자동화
+
+현재 1차 버전에서는 관리 대상 서버에 `ansible` 계정을 만들고, Ansible Control 서버에서 `ssh-copy-id`를 통해 SSH 공개키를 복사하는 방식으로 구성했습니다.
 
 ```bash
 ssh-copy-id ansible@linux-node1
 ssh-copy-id ansible@linux-node2
 ```
 
-이후 다음 명령으로 접속 여부를 확인했습니다.
+이 방식은 소규모 실습 환경에서는 충분히 단순하고 직관적입니다.
+하지만 관리 대상 서버가 20대, 50대 이상으로 늘어나면 각 서버마다 수동으로 `ssh-copy-id`를 반복해야 하므로 운영 효율성이 떨어집니다.
+
+따라서 실제 운영 환경을 고려하면 다음과 같은 방식으로 확장할 수 있습니다.
+
+```text
+1차 버전:
+  VM 생성 후 ansible 계정 생성
+  ssh-copy-id로 각 서버에 공개키 복사
+  Ansible Playbook 실행
+
+확장 버전:
+  vSphere Template 또는 사용자 지정 스크립트에서
+  ansible 계정, SSH 공개키, sudoers 설정을 자동 구성
+  VM 배포 직후부터 Ansible 접속 가능
+```
+
+---
+
+### 18.1 vSphere Template에 미리 포함할 수 있는 항목
+
+vSphere Template을 사용할 경우 템플릿 VM에 다음 항목을 미리 구성해 둘 수 있습니다.
+
+```text
+- ansible 계정 생성
+- /home/ansible/.ssh/authorized_keys 기본 구성
+- /etc/sudoers.d/ansible 파일 생성
+- sshd_config의 Match User ansible 정책 설정
+```
+
+이렇게 구성한 뒤 템플릿으로 VM을 배포하면, 배포된 VM은 처음부터 Ansible Control 서버에서 접속 가능한 상태가 됩니다.
+
+다만 `authorized_keys`에 `from="컨트롤서버IP"` 제한을 넣는 경우에는 주의가 필요합니다.
+Ansible Control 서버의 IP가 고정되어 있다면 템플릿에 미리 넣어도 되지만, 환경마다 Control 서버 IP가 달라질 수 있다면 배포 시점의 사용자 지정 스크립트에서 동적으로 적용하는 방식이 더 적합합니다.
+
+---
+
+### 18.2 사용자 지정 스크립트를 사용하는 방식
+
+vSphere의 VM 사용자 지정 규격에서는 사용자 지정 전/후 스크립트를 사용할 수 있습니다.
+
+기본 구조는 다음과 같습니다.
+
+```sh
+#!/bin/sh
+
+if [ "x$1" = x"precustomization" ]; then
+  echo "사용자 지정 전 작업 수행"
+
+elif [ "x$1" = x"postcustomization" ]; then
+  echo "사용자 지정 후 작업 수행"
+
+fi
+```
+
+여기서 Ansible 접속 계정 생성, SSH 공개키 등록, sudoers 설정은 `postcustomization` 단계에 넣는 것이 적절합니다.
+
+```text
+precustomization:
+  hostname, IP, DNS 등 사용자 지정 전 단계
+
+postcustomization:
+  hostname/IP 설정 이후 단계
+  계정 생성, SSH 키 등록, sudoers 설정에 적합
+```
+
+즉, VM의 hostname과 IP가 적용된 이후에 Ansible 접속 정책을 구성하는 흐름입니다.
+
+---
+
+
+
+### 18.3 사용자 지정 스크립트 예시
+
+아래는 Rocky Linux 기준으로 사용할 수 있는 예시입니다.
+`CONTROL_IP`와 `PUBKEY` 값은 환경에 맞게 변경해야 합니다.
+
+```sh
+#!/bin/sh
+
+if [ "x$1" = x"postcustomization" ]; then
+  CONTROL_IP="172.16.1.80"
+  PUBKEY='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIxxxxxxxxxxxxxxxxxxxxxxxx ansible-control'
+
+  groupadd -f ansible
+  id ansible >/dev/null 2>&1 || useradd -m -g ansible -s /bin/bash ansible
+
+  mkdir -p /home/ansible/.ssh
+  echo "from=\"${CONTROL_IP}\" ${PUBKEY}" > /home/ansible/.ssh/authorized_keys
+
+  chown -R ansible:ansible /home/ansible/.ssh
+  chmod 700 /home/ansible/.ssh
+  chmod 600 /home/ansible/.ssh/authorized_keys
+
+  echo '%ansible ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/ansible
+  chmod 440 /etc/sudoers.d/ansible
+  visudo -cf /etc/sudoers.d/ansible || exit 1
+
+  grep -q 'Match User ansible' /etc/ssh/sshd_config || cat >> /etc/ssh/sshd_config <<'EOF'
+# BEGIN ANSIBLE SERVICE USER POLICY
+Match User ansible
+    PasswordAuthentication no
+    PubkeyAuthentication yes
+# END ANSIBLE SERVICE USER POLICY
+EOF
+
+  sshd -t && systemctl restart sshd
+fi
+```
+
+이 스크립트가 수행하는 작업은 다음과 같습니다.
+
+| 작업                 | 설명                                    |
+| ------------------ | ------------------------------------- |
+| ansible 그룹 생성      | Ansible 전용 그룹 생성                      |
+| ansible 계정 생성      | 관리 자동화 전용 서비스 계정 생성                   |
+| authorized_keys 생성 | Control 서버의 공개키 등록                    |
+| from 제한 적용         | 지정된 Control 서버 IP에서만 SSH 키 사용 가능      |
+| sudoers 설정         | ansible 그룹에 NOPASSWD sudo 권한 부여       |
+| SSH 정책 설정          | ansible 계정은 비밀번호 로그인을 차단하고 공개키 인증만 허용 |
+| sshd 설정 검증         | `sshd -t`로 설정 문법 확인 후 재시작             |
+
+---
+
+### 18.4 authorized_keys의 from 제한
+
+중요한 부분은 다음 줄입니다.
+
+```sh
+echo "from=\"${CONTROL_IP}\" ${PUBKEY}" > /home/ansible/.ssh/authorized_keys
+```
+
+관리 대상 서버의 `/home/ansible/.ssh/authorized_keys`에는 최종적으로 다음과 같은 형식으로 저장됩니다.
+
+```text
+from="172.16.1.80" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... ansible-control
+```
+
+이 설정을 적용하면 SSH Key를 가지고 있더라도 지정된 Control 서버 IP에서만 `ansible` 계정으로 접속할 수 있습니다.
+
+```text
+Ansible Control Server: 172.16.1.80
+  └── Ansible 전용 private key 보유
+
+Managed Nodes:
+  └── ansible 계정의 authorized_keys에 Control 서버 public key 등록
+  └── from="172.16.1.80" 제한으로 Control 서버에서만 접속 허용
+```
+
+이를 통해 단순히 SSH Key를 등록하는 것보다 접속 경로를 더 제한할 수 있습니다.
+
+---
+
+### 18.5 vSphere 스크립트 크기 제한 고려
+
+vSphere 사용자 지정 스크립트 화면에는 스크립트 최대 크기 제한이 있을 수 있습니다.
+예를 들어 최대 크기가 1500자로 제한되어 있다면, 주석과 불필요한 줄바꿈을 줄인 압축 버전을 사용하는 것이 좋습니다.
+
+```sh
+#!/bin/sh
+if [ "x$1" = x"postcustomization" ]; then
+C="172.16.1.80"
+K='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIxxxxxxxxxxxxxxxxxxxxxxxx ansible-control'
+groupadd -f ansible
+id ansible >/dev/null 2>&1 || useradd -m -g ansible -s /bin/bash ansible
+mkdir -p /home/ansible/.ssh
+echo "from=\"${C}\" ${K}" > /home/ansible/.ssh/authorized_keys
+chown -R ansible:ansible /home/ansible/.ssh
+chmod 700 /home/ansible/.ssh
+chmod 600 /home/ansible/.ssh/authorized_keys
+echo '%ansible ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/ansible
+chmod 440 /etc/sudoers.d/ansible
+visudo -cf /etc/sudoers.d/ansible || exit 1
+grep -q 'Match User ansible' /etc/ssh/sshd_config || printf '\nMatch User ansible\n    PasswordAuthentication no\n    PubkeyAuthentication yes\n' >> /etc/ssh/sshd_config
+sshd -t && systemctl restart sshd
+fi
+```
+
+수정해야 할 값은 다음 두 가지입니다.
+
+```sh
+C="172.16.1.80"
+```
+
+위 값은 Ansible Control 서버의 IP로 변경합니다.
+
+```sh
+K='ssh-ed25519 AAAA... ansible-control'
+```
+
+위 값은 Ansible Control 서버에서 생성한 공개키 내용으로 변경합니다.
+
+Control 서버에서 공개키는 다음 명령으로 확인할 수 있습니다.
 
 ```bash
-ansible -i inventory.ini linux_servers -m ping
+cat ~/.ssh/id_ed25519_ansible.pub
 ```
+
+출력된 한 줄 전체를 `K='...'` 안에 넣으면 됩니다.
 
 ---
 
-### 17.2 sudo 권한 문제
+### 18.6 템플릿 VM에 사전 준비할 항목
 
-관리 대상 서버에서 Ansible 작업을 root 권한으로 실행해야 하므로 `ansible_become=true`를 설정했습니다.
+사용자 지정 스크립트 방식이 정상적으로 동작하려면 템플릿 VM에 최소한 다음 항목이 준비되어 있어야 합니다.
 
-```ini
-[linux_servers:vars]
-ansible_user=ansible
-ansible_become=true
-ansible_become_method=sudo
+```text
+1. open-vm-tools 설치
+2. sshd 활성화
+3. sudo 설치
+4. NetworkManager 정상 동작
+5. VM을 템플릿으로 변환하기 전 machine-id 정리
 ```
+
+Rocky Linux 템플릿에서 미리 준비할 수 있는 명령은 다음과 같습니다.
 
 ```bash
-%ansible ALL=(ALL) NOPASSWD: ALL
+sudo dnf install -y open-vm-tools perl sudo openssh-server
+sudo systemctl enable --now vmtoolsd
+sudo systemctl enable --now sshd
 ```
 
-또한 관리 대상 서버의 ansible 사용자가 sudo 권한을 패스워드 사용없이 사용할 수 있도록 visudo에  내용을 추가하여 구성했습니다.
-
----
-
-### 17.3 firewalld 모듈 사용 문제
-
-`ansible.posix.firewalld` 모듈을 사용하기 위해 필요한 collection을 설치했습니다.
+템플릿으로 변환하기 전에는 machine-id를 정리하여, 템플릿에서 복제된 VM들이 동일한 machine-id를 공유하지 않도록 합니다.
 
 ```bash
-ansible-galaxy collection install ansible.posix
+sudo truncate -s 0 /etc/machine-id
+sudo rm -f /var/lib/dbus/machine-id
+sudo ln -s /etc/machine-id /var/lib/dbus/machine-id
 ```
 
----
+필요하다면 로그도 정리할 수 있습니다.
 
-## 18. 향후 개선 방향
+```bash
+sudo journalctl --rotate
+sudo journalctl --vacuum-time=1s
+sudo rm -f /var/log/*.log
+```
 
-현재 프로젝트는 1차 버전으로 Linux 서버 초기 설정 자동화에 집중했습니다.
-향후에는 다음 기능을 추가하여 프로젝트를 확장할 수 있습니다.
-
-### 2차 버전 개선 방향
-
-* auditd rule 배포
-* 로그 디렉토리 생성 및 권한 설정
-* cron 작업 등록
-* systemd timer 등록
-* NFS/autofs 설정 자동화
-
-### 3차 버전 개선 방향
-
-* vSphere Template 연동
-* Terraform을 이용한 VM 생성 자동화
-* Ansible Vault를 이용한 민감정보 관리
-* ansible-lint를 이용한 Playbook 정적 검사
-* GitHub Actions를 이용한 Playbook 문법 검사 자동화
+이후 VM을 종료하고 vSphere Template으로 변환하면 됩니다.
 
 ---
+
+### 18.7 배포 후 확인 방법
+
+템플릿에서 VM을 배포한 뒤 Ansible Control 서버에서 SSH 접속을 확인합니다.
+
+```bash
+ssh -i ~/.ssh/id_ed25519_ansible ansible@새VM_IP
+```
+
+sudo 권한도 확인합니다.
+
+```bash
+sudo whoami
+```
+
+기대 결과는 다음과 같습니다.
+
+```text
+root
+```
+
+Ansible 연결 테스트는 다음과 같이 수행합니다.
+
+```bash
+ansible -i inventory.ini all -m ping
+```
+
+become 권한까지 확인하려면 다음 명령을 사용할 수 있습니다.
+
+```bash
+ansible -i inventory.ini all -b -m command -a "whoami"
+```
+
+결과가 `root`로 출력되면 Ansible 접속 계정, SSH Key 인증, sudo 권한이 모두 정상적으로 구성된 것입니다.
+
+---
+
+### 18.8 방식 비교
+
+| 방식                     | 설명                                 | 장점                     | 단점                        |
+| ---------------------- | ---------------------------------- | ---------------------- | ------------------------- |
+| 수동 ssh-copy-id         | VM 생성 후 각 서버에 공개키 복사               | 단순하고 이해하기 쉬움           | 서버 수가 늘어나면 반복 작업 증가       |
+| Bootstrap Playbook     | 초기 접속 계정으로 ansible 계정/키/sudoers 배포 | 기존 서버에도 적용 가능          | 최초 접속 가능한 계정 필요           |
+| vSphere Template 사전 구성 | 템플릿 안에 ansible 계정/키/sudoers 포함     | VM 배포 즉시 Ansible 접속 가능 | Control 서버 IP가 바뀌면 관리 어려움 |
+| vSphere 사용자 지정 스크립트    | VM 배포 시점에 계정/키/sudoers 생성          | 배포 환경에 따라 동적 적용 가능     | 스크립트 관리 필요                |
+
+현재 1차 버전에서는 `ssh-copy-id`를 사용했지만, 서버 규모가 커질수록 Bootstrap Playbook이나 vSphere 사용자 지정 스크립트 방식이 더 적합합니다.
+
+최종적으로는 다음과 같은 방향이 더 현업에 가까운 구조입니다.
+
+```text
+vSphere Template
+  └── 공통 OS 설정, open-vm-tools, sshd, sudo, NetworkManager 준비
+
+VM Customization Spec
+  └── hostname/IP 적용
+  └── postcustomization 스크립트로 ansible 계정/키/sudoers 설정
+
+Ansible
+  └── 배포된 VM에 접속
+  └── 사용자, 패키지, 방화벽, 서비스, 보안 설정 자동화
+```
+
+이 구조를 사용하면 VM을 새로 배포하는 순간부터 Ansible이 접속 가능한 상태가 되며, 이후 서버 초기 설정은 Playbook으로 일관되게 관리할 수 있습니다.
+
+
 
 ## 19. 프로젝트 의의
 
