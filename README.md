@@ -886,6 +886,15 @@ postcustomization:
 
 ### 18.3 사용자 지정 스크립트 예시
 
+![alt text](picture/image-9.png)
+
+vSphere에서 VM 사용자 지정 규칙을 생성합니다.
+
+![alt text](picture/image-8.png)
+
+사용자 지정 스크립트에 다음과 같이 작성합니다.
+
+
 아래는 Rocky Linux 기준으로 사용할 수 있는 예시입니다.
 `CONTROL_IP`와 `PUBKEY` 값은 환경에 맞게 변경해야 합니다.
 
@@ -1083,3 +1092,8 @@ Ansible
 
 ---
 
+## 관련 문서
+
+ 문서 | 설명 |
+|---|---|
+|  [vSphere Template 및 사용자 지정 규칙 생성](https://app.notion.com/p/Template-Customization-Specification-30c65bdd009e8046bf8ef2678b0dd676?source=copy_link) | vSphere를 통한 VM Template 생성 및 Customization Specification 생성 |
