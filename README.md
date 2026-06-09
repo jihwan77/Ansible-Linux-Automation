@@ -965,56 +965,9 @@ Managed Nodes:
 
 ---
 
-### 18.5 vSphere 스크립트 크기 제한 고려
 
-vSphere 사용자 지정 스크립트 화면에는 스크립트 최대 크기 제한이 있을 수 있습니다.
-예를 들어 최대 크기가 1500자로 제한되어 있다면, 주석과 불필요한 줄바꿈을 줄인 압축 버전을 사용하는 것이 좋습니다.
 
-```sh
-#!/bin/sh
-if [ "x$1" = x"postcustomization" ]; then
-C="172.16.1.80"
-K='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIxxxxxxxxxxxxxxxxxxxxxxxx ansible-control'
-groupadd -f ansible
-id ansible >/dev/null 2>&1 || useradd -m -g ansible -s /bin/bash ansible
-mkdir -p /home/ansible/.ssh
-echo "from=\"${C}\" ${K}" > /home/ansible/.ssh/authorized_keys
-chown -R ansible:ansible /home/ansible/.ssh
-chmod 700 /home/ansible/.ssh
-chmod 600 /home/ansible/.ssh/authorized_keys
-echo '%ansible ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/ansible
-chmod 440 /etc/sudoers.d/ansible
-visudo -cf /etc/sudoers.d/ansible || exit 1
-grep -q 'Match User ansible' /etc/ssh/sshd_config || printf '\nMatch User ansible\n    PasswordAuthentication no\n    PubkeyAuthentication yes\n' >> /etc/ssh/sshd_config
-sshd -t && systemctl restart sshd
-fi
-```
-
-수정해야 할 값은 다음 두 가지입니다.
-
-```sh
-C="172.16.1.80"
-```
-
-위 값은 Ansible Control 서버의 IP로 변경합니다.
-
-```sh
-K='ssh-ed25519 AAAA... ansible-control'
-```
-
-위 값은 Ansible Control 서버에서 생성한 공개키 내용으로 변경합니다.
-
-Control 서버에서 공개키는 다음 명령으로 확인할 수 있습니다.
-
-```bash
-cat ~/.ssh/id_ed25519_ansible.pub
-```
-
-출력된 한 줄 전체를 `K='...'` 안에 넣으면 됩니다.
-
----
-
-### 18.6 템플릿 VM에 사전 준비할 항목
+### 18.5 템플릿 VM에 사전 준비할 항목
 
 사용자 지정 스크립트 방식이 정상적으로 동작하려면 템플릿 VM에 최소한 다음 항목이 준비되어 있어야 합니다.
 
@@ -1054,7 +1007,7 @@ sudo rm -f /var/log/*.log
 
 ---
 
-### 18.7 배포 후 확인 방법
+### 18.6 배포 후 확인 방법
 
 템플릿에서 VM을 배포한 뒤 Ansible Control 서버에서 SSH 접속을 확인합니다.
 
@@ -1090,7 +1043,7 @@ ansible -i inventory.ini all -b -m command -a "whoami"
 
 ---
 
-### 18.8 방식 비교
+### 18.7 방식 비교
 
 | 방식                     | 설명                                 | 장점                     | 단점                        |
 | ---------------------- | ---------------------------------- | ---------------------- | ------------------------- |
@@ -1101,7 +1054,7 @@ ansible -i inventory.ini all -b -m command -a "whoami"
 
 현재 1차 버전에서는 `ssh-copy-id`를 사용했지만, 서버 규모가 커질수록 Bootstrap Playbook이나 vSphere 사용자 지정 스크립트 방식이 더 적합합니다.
 
-최종적으로는 다음과 같은 방향이 더 현업에 가까운 구조입니다.
+최종적으로 다음과 같은 구조입니다.
 
 ```text
 vSphere Template
