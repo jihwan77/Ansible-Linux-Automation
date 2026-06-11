@@ -1099,3 +1099,4 @@ Ansible
  문서 | 설명 |
 |---|---|
 |  [vSphere Template 및 사용자 지정 규칙 생성](https://app.notion.com/p/Template-Customization-Specification-30c65bdd009e8046bf8ef2678b0dd676?source=copy_link) | vSphere를 통한 VM Template 생성 및 Customization Specification 생성 |
+|  [ansible을 이용한 k8s cluster 자동화](https://github.com/jihwan77/Ansible-k8s-cluster-Automation) | 현재 프로젝트 내용을 이용하여 k8s 환경을 자동화한 프로젝트 |
